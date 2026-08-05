@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sys
 import time
@@ -26,14 +27,18 @@ except ImportError:
 class BenchmarkResult:
     """Data class storing OCR processing results and performance metrics."""
 
+    engine_name: str
     image_path: str
     text: str
     execution_time_sec: float
     peak_rss_mb: float
+    manual_evaluation: float
 
 
 class BaseOCREngine(ABC):
     """Abstract base class for OCR engine implementations."""
+
+    name: str = "BaseEngine"
 
     @abstractmethod
     def process_image(self, image_path: str) -> str:
@@ -50,6 +55,8 @@ class BaseOCREngine(ABC):
 
 class RapidOCREngine(BaseOCREngine):
     """OCR engine implementation using RapidOCR."""
+
+    name: str = "RapidOCR"
 
     def __init__(self):
         if RapidOCR is None:
@@ -127,6 +134,23 @@ def get_image_paths(input_path: str) -> List[str]:
     raise ValueError(f"Invalid input path: {input_path}")
 
 
+def prompt_manual_evaluation() -> float:
+    """Prompt user for manual evaluation score between 1.0 and 5.0.
+
+    Returns:
+        float: Validated user evaluation score.
+    """
+    while True:
+        try:
+            user_input = input("Enter manual evaluation score (1.0 - 5.0): ")
+            score = float(user_input)
+            if 1.0 <= score <= 5.0:
+                return score
+            print("Score must be between 1.0 and 5.0.")
+        except ValueError:
+            print("Invalid input. Please enter a valid number.")
+
+
 def process_benchmark(engine: BaseOCREngine, image_paths: List[str]) -> List[BenchmarkResult]:
     """Execute OCR on images and record processing metrics.
 
@@ -139,20 +163,65 @@ def process_benchmark(engine: BaseOCREngine, image_paths: List[str]) -> List[Ben
     """
     results = []
     for path in image_paths:
+        print(f"\nProcessing: {path}")
         start_time = time.perf_counter()
         text = engine.process_image(path)
         elapsed_time = time.perf_counter() - start_time
         peak_rss = get_peak_rss_mb()
 
+        print(f"Time: {elapsed_time:.4f}s | Peak RSS: {peak_rss:.2f} MB")
+        print("--- Recognized Text ---")
+        print(text if text else "[No text detected]")
+        print("-" * 40)
+
+        score = prompt_manual_evaluation()
+
         results.append(
             BenchmarkResult(
+                engine_name=engine.name,
                 image_path=path,
                 text=text,
                 execution_time_sec=elapsed_time,
                 peak_rss_mb=peak_rss,
+                manual_evaluation=score,
             )
         )
     return results
+
+
+def save_results_to_json(results: List[BenchmarkResult], output_path: str) -> None:
+    """Save benchmark results to a JSON file matching the OCR schema format.
+
+    Args:
+        results (List[BenchmarkResult]): List of benchmark result objects.
+        output_path (str): Path to the output JSON file.
+    """
+    existing_data = []
+
+    if os.path.exists(output_path):
+        try:
+            with open(output_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+                if content:
+                    loaded_json = json.loads(content)
+                    if isinstance(loaded_json, list):
+                        existing_data = loaded_json
+        except (json.JSONDecodeError, OSError):
+            existing_data = []
+
+    for res in results:
+        entry = {
+            "engine_name": res.engine_name,
+            "file_name": res.image_path,
+            "recognized_text": res.text,
+            "time_seconds": round(res.execution_time_sec, 4),
+            "memory_usage_mb": round(res.peak_rss_mb, 2),
+            "manual_evaluation": res.manual_evaluation,
+        }
+        existing_data.append(entry)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(existing_data, f, ensure_ascii=False, indent=2)
 
 
 def main():
@@ -171,6 +240,11 @@ def main():
         default="rapidocr",
         help="OCR engine to use",
     )
+    parser.add_argument(
+        "-o",
+        "--output",
+        help="Path to output JSON file",
+    )
     args = parser.parse_args()
 
     image_paths = get_image_paths(args.input)
@@ -179,13 +253,9 @@ def main():
 
     results = process_benchmark(engine, image_paths)
 
-    for res in results:
-        print(f"File: {res.image_path}")
-        print(
-            f"Time: {res.execution_time_sec:.4f}s | Peak RSS: {res.peak_rss_mb:.2f} MB")
-        print("--- Recognized Text ---")
-        print(res.text)
-        print("-" * 40)
+    if args.output:
+        save_results_to_json(results, args.output)
+        print(f"\nResults successfully saved to {args.output}")
 
 
 if __name__ == "__main__":
