@@ -1,12 +1,35 @@
 import argparse
 import os
+import sys
+import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Dict, List, Type
+
+try:
+    import resource
+except ImportError:
+    resource = None
+
+try:
+    import psutil
+except ImportError:
+    psutil = None
 
 try:
     from rapidocr_onnxruntime import RapidOCR
 except ImportError:
     RapidOCR = None
+
+
+@dataclass
+class BenchmarkResult:
+    """Data class storing OCR processing results and performance metrics."""
+
+    image_path: str
+    text: str
+    execution_time_sec: float
+    peak_rss_mb: float
 
 
 class BaseOCREngine(ABC):
@@ -55,6 +78,30 @@ ENGINE_REGISTRY: Dict[str, Type[BaseOCREngine]] = {
 }
 
 
+def get_peak_rss_mb() -> float:
+    """Get the process peak Resident Set Size (RSS) memory in Megabytes.
+
+    Returns:
+        float: Peak RSS memory in MB.
+    """
+
+    # Linux and MacOS
+    if resource is not None:
+        rusage = resource.getrusage(resource.RUSAGE_SELF)
+        if sys.platform == "darwin":
+            return rusage.ru_maxrss / (1024 * 1024)
+        return rusage.ru_maxrss / 1024
+
+    # Windows
+    if psutil is not None:
+        process = psutil.Process(os.getpid())
+        mem_info = process.memory_info()
+        peak_bytes = getattr(mem_info, "peak_wset", mem_info.rss)
+        return peak_bytes / (1024 * 1024)
+
+    return 0.0
+
+
 def get_image_paths(input_path: str) -> List[str]:
     """Collect valid image paths from a file or directory.
 
@@ -80,6 +127,34 @@ def get_image_paths(input_path: str) -> List[str]:
     raise ValueError(f"Invalid input path: {input_path}")
 
 
+def process_benchmark(engine: BaseOCREngine, image_paths: List[str]) -> List[BenchmarkResult]:
+    """Execute OCR on images and record processing metrics.
+
+    Args:
+        engine (BaseOCREngine): OCR engine instance.
+        image_paths (List[str]): List of image file paths to process.
+
+    Returns:
+        List[BenchmarkResult]: List of benchmark results for each image.
+    """
+    results = []
+    for path in image_paths:
+        start_time = time.perf_counter()
+        text = engine.process_image(path)
+        elapsed_time = time.perf_counter() - start_time
+        peak_rss = get_peak_rss_mb()
+
+        results.append(
+            BenchmarkResult(
+                image_path=path,
+                text=text,
+                execution_time_sec=elapsed_time,
+                peak_rss_mb=peak_rss,
+            )
+        )
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Lightweight script that allows to benchmark different OCR engines on the same files.")
@@ -102,12 +177,15 @@ def main():
     engine_class = ENGINE_REGISTRY[args.engine]
     engine = engine_class()
 
-    for path in image_paths:
-        print(f"Processing: {path}")
-        text = engine.process_image(path)
+    results = process_benchmark(engine, image_paths)
+
+    for res in results:
+        print(f"File: {res.image_path}")
+        print(
+            f"Time: {res.execution_time_sec:.4f}s | Peak RSS: {res.peak_rss_mb:.2f} MB")
         print("--- Recognized Text ---")
-        print(text)
-        print("-" * 24)
+        print(res.text)
+        print("-" * 40)
 
 
 if __name__ == "__main__":
