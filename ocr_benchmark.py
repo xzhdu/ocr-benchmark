@@ -22,6 +22,20 @@ try:
 except ImportError:
     RapidOCR = None
 
+try:
+    import pytesseract
+    from PIL import Image
+except ImportError:
+    pytesseract = None
+    Image = None
+
+try:
+    from doctr.io import DocumentFile
+    from doctr.models import ocr_predictor
+except ImportError:
+    DocumentFile = None
+    ocr_predictor = None
+
 
 @dataclass
 class BenchmarkResult:
@@ -80,8 +94,73 @@ class RapidOCREngine(BaseOCREngine):
         return "\n".join([line[1] for line in result])
 
 
+class TesseractEngine(BaseOCREngine):
+    """OCR engine implementation using Tesseract."""
+
+    name: str = "Tesseract"
+
+    def __init__(self):
+        if pytesseract is None or Image is None:
+            raise ImportError(
+                "pytesseract or Pillow is not installed. "
+                "Install them via 'pip install pytesseract pillow'."
+            )
+
+    def process_image(self, image_path: str) -> str:
+        """Extract text from an image file using Tesseract OCR.
+
+        Args:
+            image_path (str): Path to the image file.
+
+        Returns:
+            str: Extracted text.
+        """
+        with Image.open(image_path) as img:
+            return pytesseract.image_to_string(img).strip()
+
+
+class DocTREngine(BaseOCREngine):
+    """OCR engine implementation using docTR."""
+
+    name: str = "docTR"
+
+    def __init__(self):
+        if ocr_predictor is None or DocumentFile is None:
+            raise ImportError(
+                "python-doctr is not installed. "
+                "Install it via 'pip install python-doctr'."
+            )
+        self.model = ocr_predictor(pretrained=True)
+
+    def process_image(self, image_path: str) -> str:
+        """Extract text from an image file using docTR.
+
+        Args:
+            image_path (str): Path to the image file.
+
+        Returns:
+            str: Extracted text separated by lines.
+        """
+        doc = DocumentFile.from_images(image_path)
+        result = self.model(doc)
+        export = result.export()
+
+        extracted_lines = []
+        for page in export.get("pages", []):
+            for block in page.get("blocks", []):
+                for line in block.get("lines", []):
+                    line_words = [
+                        word["value"] for word in line.get("words", [])
+                    ]
+                    extracted_lines.append(" ".join(line_words))
+
+        return "\n".join(extracted_lines)
+
+
 ENGINE_REGISTRY: Dict[str, Type[BaseOCREngine]] = {
     "rapidocr": RapidOCREngine,
+    "tesseract": TesseractEngine,
+    "doctr": DocTREngine,
 }
 
 
