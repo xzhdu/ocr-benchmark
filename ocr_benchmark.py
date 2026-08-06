@@ -5,7 +5,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Type
+from typing import Dict, List, Optional, Sequence, Type, Union
 
 try:
     import resource
@@ -13,7 +13,7 @@ except ImportError:
     resource = None
 
 try:
-    import psutil
+    import psutil  # type: ignore
 except ImportError:
     psutil = None
 
@@ -47,6 +47,8 @@ class BenchmarkResult:
     execution_time_sec: float
     peak_rss_mb: float
     manual_evaluation: float
+    wer: Optional[float] = None
+    cer: Optional[float] = None
 
 
 class BaseOCREngine(ABC):
@@ -164,6 +166,71 @@ ENGINE_REGISTRY: Dict[str, Type[BaseOCREngine]] = {
 }
 
 
+def compute_levenshtein_distance(seq1: Union[str, Sequence[str]], seq2: Union[str, Sequence[str]]) -> int:
+    """Compute Levenshtein edit distance between two sequences.
+
+    Args:
+        seq1 (Union[str, Sequence[str]]): Source sequence.
+        seq2 (Union[str, Sequence[str]]): Target sequence.
+
+    Returns:
+        int: Edit distance value.
+    """
+    m, n = len(seq1), len(seq2)
+    dp = [[0] * (n + 1) for _ in range(m + 1)]
+
+    for i in range(m + 1):
+        dp[i][0] = i
+    for j in range(n + 1):
+        dp[0][j] = j
+
+    for i in range(1, m + 1):
+        for j in range(1, n + 1):
+            if seq1[i - 1] == seq2[j - 1]:
+                dp[i][j] = dp[i - 1][j - 1]
+            else:
+                dp[i][j] = 1 + min(
+                    dp[i - 1][j],
+                    dp[i][j - 1],
+                    dp[i - 1][j - 1],
+                )
+    return dp[m][n]
+
+
+def calculate_cer(reference: str, hypothesis: str) -> float:
+    """Calculate Character Error Rate (CER).
+
+    Args:
+        reference (str): Ground truth reference text.
+        hypothesis (str): Recognized OCR text.
+
+    Returns:
+        float: Character Error Rate ratio.
+    """
+    if not reference:
+        return 0.0 if not hypothesis else 1.0
+    distance = compute_levenshtein_distance(reference, hypothesis)
+    return distance / len(reference)
+
+
+def calculate_wer(reference: str, hypothesis: str) -> float:
+    """Calculate Word Error Rate (WER).
+
+    Args:
+        reference (str): Ground truth reference text.
+        hypothesis (str): Recognized OCR text.
+
+    Returns:
+        float: Word Error Rate ratio.
+    """
+    ref_words = reference.split()
+    hyp_words = hypothesis.split()
+    if not ref_words:
+        return 0.0 if not hyp_words else 1.0
+    distance = compute_levenshtein_distance(ref_words, hyp_words)
+    return distance / len(ref_words)
+
+
 def get_peak_rss_mb() -> float:
     """Get the process peak Resident Set Size (RSS) memory in Megabytes.
 
@@ -213,6 +280,21 @@ def get_image_paths(input_path: str) -> List[str]:
     raise ValueError(f"Invalid input path: {input_path}")
 
 
+def load_ground_truth(gt_path: str) -> Dict[str, str]:
+    """Load ground truth JSON dictionary mapping filenames to reference text.
+
+    Args:
+        gt_path (str): Path to the ground truth JSON file.
+
+    Returns:
+        Dict[str, str]: Mapping from image filename to ground truth text.
+    """
+    if not os.path.exists(gt_path):
+        raise FileNotFoundError(f"Ground truth file not found: {gt_path}")
+    with open(gt_path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
 def prompt_manual_evaluation() -> float:
     """Prompt user for manual evaluation score between 1.0 and 5.0.
 
@@ -230,25 +312,37 @@ def prompt_manual_evaluation() -> float:
             print("Invalid input. Please enter a valid number.")
 
 
-def process_benchmark(engine: BaseOCREngine, image_paths: List[str]) -> List[BenchmarkResult]:
+def process_benchmark(engine: BaseOCREngine, image_paths: List[str], ground_truth: Optional[Dict[str, str]] = None,) -> List[BenchmarkResult]:
     """Execute OCR on images and record processing metrics.
 
     Args:
         engine (BaseOCREngine): OCR engine instance.
         image_paths (List[str]): List of image file paths to process.
+        ground_truth (Optional[Dict[str, str]]): Ground truth dictionary.
 
     Returns:
         List[BenchmarkResult]: List of benchmark results for each image.
     """
     results = []
     for path in image_paths:
+        file_name = os.path.basename(path)
         print(f"\nProcessing: {path}")
+
         start_time = time.perf_counter()
         text = engine.process_image(path)
         elapsed_time = time.perf_counter() - start_time
         peak_rss = get_peak_rss_mb()
 
-        print(f"Time: {elapsed_time:.4f}s | Peak RSS: {peak_rss:.2f} MB")
+        wer, cer = None, None
+        if ground_truth and file_name in ground_truth:
+            ref_text = ground_truth[file_name]
+            wer = calculate_wer(ref_text, text)
+            cer = calculate_cer(ref_text, text)
+            print(f"WER: {wer:.4f} | CER: {cer:.4f}")
+
+        print(
+            f"Time: {elapsed_time:.4f}s | Peak RSS: {peak_rss:.2f} MB"
+        )
         print("--- Recognized Text ---")
         print(text if text else "[No text detected]")
         print("-" * 40)
@@ -258,11 +352,13 @@ def process_benchmark(engine: BaseOCREngine, image_paths: List[str]) -> List[Ben
         results.append(
             BenchmarkResult(
                 engine_name=engine.name,
-                image_path=path,
+                image_path=file_name,
                 text=text,
                 execution_time_sec=elapsed_time,
                 peak_rss_mb=peak_rss,
                 manual_evaluation=score,
+                wer=wer,
+                cer=cer,
             )
         )
     return results
@@ -295,6 +391,8 @@ def save_results_to_json(results: List[BenchmarkResult], output_path: str) -> No
             "recognized_text": res.text,
             "time_seconds": round(res.execution_time_sec, 4),
             "memory_usage_mb": round(res.peak_rss_mb, 2),
+            "wer": round(res.wer, 4) if res.wer is not None else None,
+            "cer": round(res.cer, 4) if res.cer is not None else None,
             "manual_evaluation": res.manual_evaluation,
         }
         existing_data.append(entry)
@@ -320,6 +418,11 @@ def main():
         help="OCR engine to use",
     )
     parser.add_argument(
+        "-g",
+        "--ground-truth",
+        help="Path to ground truth JSON file",
+    )
+    parser.add_argument(
         "-o",
         "--output",
         help="Path to output JSON file",
@@ -330,7 +433,11 @@ def main():
     engine_class = ENGINE_REGISTRY[args.engine]
     engine = engine_class()
 
-    results = process_benchmark(engine, image_paths)
+    ground_truth_map = None
+    if args.ground_truth:
+        ground_truth_map = load_ground_truth(args.ground_truth)
+
+    results = process_benchmark(engine, image_paths, ground_truth_map)
 
     if args.output:
         save_results_to_json(results, args.output)
