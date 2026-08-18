@@ -1,0 +1,6 @@
+rapidocr-onnxruntime>=1.4.4
+pytesseract>=0.3.13
+python-doctr>=1.0.1
+pillow>=12.3.0
+opencv-python>=4.14.0.94
+matplotlib>=3.11.1
