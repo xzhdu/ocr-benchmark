@@ -5,7 +5,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Type, Union
+from typing import Dict, List, Optional, Sequence, Tuple, Type, Union
 
 try:
     import resource
@@ -16,6 +16,19 @@ try:
     import psutil  # type: ignore
 except ImportError:
     psutil = None
+
+try:
+    import cv2
+    import numpy as np
+except ImportError:
+    cv2 = None
+    np = None
+
+try:
+    import matplotlib
+    import matplotlib.pyplot as plt
+except ImportError:
+    plt = None
 
 try:
     from rapidocr_onnxruntime import RapidOCR
@@ -38,6 +51,15 @@ except ImportError:
 
 
 @dataclass
+class OCRBox:
+    """Bounding box representation with polygon points and recognized text."""
+
+    box: List[List[int]]
+    text: str = ""
+    confidence: Optional[float] = None
+
+
+@dataclass
 class BenchmarkResult:
     """Data class storing OCR processing results and performance metrics."""
 
@@ -57,14 +79,14 @@ class BaseOCREngine(ABC):
     name: str = "BaseEngine"
 
     @abstractmethod
-    def process_image(self, image_path: str) -> str:
-        """Extract text from the given image path.
+    def process_image(self, image_path: str) -> Tuple[str, List[OCRBox]]:
+        """Extract text and bounding boxes from the given image path.
 
         Args:
             image_path (str): Path to the input image file.
 
         Returns:
-            str: Recognized text.
+            Tuple[str, List[OCRBox]]: Recognized text and list of bounding boxes.
         """
         pass
 
@@ -81,19 +103,29 @@ class RapidOCREngine(BaseOCREngine):
             )
         self.engine = RapidOCR()
 
-    def process_image(self, image_path: str) -> str:
+    def process_image(self, image_path: str) -> Tuple[str, List[OCRBox]]:
         """Extract text from an image file using RapidOCR.
 
         Args:
             image_path (str): Path to the image file.
 
         Returns:
-            str: Extracted text separated by lines.
+            Tuple[str, List[OCRBox]]: Extracted text and bounding boxes.
         """
         result, _ = self.engine(image_path)
         if not result:
-            return ""
-        return "\n".join([line[1] for line in result])
+            return "", []
+
+        extracted_lines = []
+        boxes = []
+        for item in result:
+            box_coords = [[int(round(pt[0])), int(round(pt[1]))] for pt in item[0]]
+            line_text = str(item[1])
+            score = float(item[2]) if len(item) > 2 else None
+            extracted_lines.append(line_text)
+            boxes.append(OCRBox(box=box_coords, text=line_text, confidence=score))
+
+        return "\n".join(extracted_lines), boxes
 
 
 class TesseractEngine(BaseOCREngine):
@@ -108,17 +140,45 @@ class TesseractEngine(BaseOCREngine):
                 "Install them via 'pip install pytesseract pillow'."
             )
 
-    def process_image(self, image_path: str) -> str:
+    def process_image(self, image_path: str) -> Tuple[str, List[OCRBox]]:
         """Extract text from an image file using Tesseract OCR.
 
         Args:
             image_path (str): Path to the image file.
 
         Returns:
-            str: Extracted text.
+            Tuple[str, List[OCRBox]]: Extracted text and bounding boxes.
         """
         with Image.open(image_path) as img:
-            return pytesseract.image_to_string(img).strip()
+            full_text = pytesseract.image_to_string(img).strip()
+            data = pytesseract.image_to_data(img, output_type=pytesseract.Output.DICT)
+
+        boxes = []
+        num_boxes = len(data.get("text", []))
+        for i in range(num_boxes):
+            word_text = data["text"][i].strip()
+            if not word_text:
+                continue
+            x = int(data["left"][i])
+            y = int(data["top"][i])
+            w = int(data["width"][i])
+            h = int(data["height"][i])
+            conf_val = None
+            if "conf" in data and str(data["conf"][i]) != "-1":
+                try:
+                    conf_val = float(data["conf"][i]) / 100.0
+                except (ValueError, TypeError):
+                    conf_val = None
+
+            poly_box = [
+                [x, y],
+                [x + w, y],
+                [x + w, y + h],
+                [x, y + h],
+            ]
+            boxes.append(OCRBox(box=poly_box, text=word_text, confidence=conf_val))
+
+        return full_text, boxes
 
 
 class DocTREngine(BaseOCREngine):
@@ -134,21 +194,25 @@ class DocTREngine(BaseOCREngine):
             )
         self.model = ocr_predictor(pretrained=True)
 
-    def process_image(self, image_path: str) -> str:
+    def process_image(self, image_path: str) -> Tuple[str, List[OCRBox]]:
         """Extract text from an image file using docTR.
 
         Args:
             image_path (str): Path to the image file.
 
         Returns:
-            str: Extracted text separated by lines.
+            Tuple[str, List[OCRBox]]: Extracted text and bounding boxes.
         """
         doc = DocumentFile.from_images(image_path)
         result = self.model(doc)
         export = result.export()
 
         extracted_lines = []
+        boxes = []
         for page in export.get("pages", []):
+            page_dims = page.get("dimensions", (1, 1))
+            page_h, page_w = page_dims[0], page_dims[1]
+
             for block in page.get("blocks", []):
                 for line in block.get("lines", []):
                     line_words = [
@@ -156,7 +220,20 @@ class DocTREngine(BaseOCREngine):
                     ]
                     extracted_lines.append(" ".join(line_words))
 
-        return "\n".join(extracted_lines)
+                    for word in line.get("words", []):
+                        val = word.get("value", "")
+                        geom = word.get("geometry")
+                        conf = word.get("confidence")
+                        if geom:
+                            (xmin, ymin), (xmax, ymax) = geom
+                            x1 = int(round(float(xmin) * page_w))
+                            y1 = int(round(float(ymin) * page_h))
+                            x2 = int(round(float(xmax) * page_w))
+                            y2 = int(round(float(ymax) * page_h))
+                            poly = [[x1, y1], [x2, y1], [x2, y2], [x1, y2]]
+                            boxes.append(OCRBox(box=poly, text=val, confidence=float(conf) if conf is not None else None))
+
+        return "\n".join(extracted_lines), boxes
 
 
 ENGINE_REGISTRY: Dict[str, Type[BaseOCREngine]] = {
@@ -312,24 +389,142 @@ def prompt_manual_evaluation() -> float:
             print("Invalid input. Please enter a valid number.")
 
 
-def process_benchmark(engine: BaseOCREngine, image_paths: List[str], ground_truth: Optional[Dict[str, str]] = None,) -> List[BenchmarkResult]:
+def draw_bounding_boxes(
+    image_path: str,
+    boxes: List[OCRBox],
+    draw_labels: bool = True,
+) -> Optional["np.ndarray"]:
+    """Draw bounding boxes and optional labels on an image.
+
+    Args:
+        image_path (str): Path to the image file.
+        boxes (List[OCRBox]): Detected bounding boxes.
+        draw_labels (bool): Whether to draw text labels.
+
+    Returns:
+        Optional[np.ndarray]: Annotated image or None if loading failed.
+    """
+    if cv2 is None or np is None:
+        return None
+
+    img = cv2.imread(image_path)
+    if img is None:
+        return None
+
+    annotated = img.copy()
+    for item in boxes:
+        pts = np.array(item.box, dtype=np.int32).reshape((-1, 1, 2))
+        cv2.polylines(annotated, [pts], isClosed=True, color=(0, 255, 0), thickness=2)
+
+        if draw_labels and item.text:
+            label = item.text
+            if item.confidence is not None:
+                label += f" ({item.confidence:.2f})"
+
+            x, y = item.box[0][0], item.box[0][1]
+            (w, h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
+            cv2.rectangle(
+                annotated,
+                (x, max(0, y - h - 4)),
+                (x + w, max(0, y)),
+                (0, 255, 0),
+                -1,
+            )
+            cv2.putText(
+                annotated,
+                label,
+                (x, max(0, y - 2)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.4,
+                (0, 0, 0),
+                1,
+                cv2.LINE_AA,
+            )
+
+    return annotated
+
+
+def display_bounding_boxes(
+    window_title: str,
+    annotated_image: "np.ndarray",
+) -> Optional[object]:
+    """Display annotated image in a window using matplotlib.
+
+    Args:
+        window_title (str): Title of the window.
+        annotated_image (np.ndarray): Image array with bounding boxes (BGR format from cv2).
+
+    Returns:
+        Optional[object]: Matplotlib figure object if displayed, None otherwise.
+    """
+    if plt is None or annotated_image is None:
+        return None
+
+    try:
+        if cv2 is not None:
+            rgb_image = cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB)
+        else:
+            rgb_image = annotated_image
+
+        plt.ion()
+        fig = plt.figure(num=window_title, figsize=(10, 8))
+        plt.clf()
+        ax = fig.add_subplot(111)
+        ax.imshow(rgb_image)
+        ax.axis("off")
+        ax.set_title(window_title)
+        fig.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.05)
+        return fig
+    except Exception as e:
+        print(f"Warning: Unable to display bounding boxes window: {e}")
+        return None
+
+
+def close_bounding_boxes(fig: Optional[object]) -> None:
+    """Close the active matplotlib window.
+
+    Args:
+        fig (Optional[object]): Matplotlib figure object to close.
+    """
+    if plt is not None and fig is not None:
+        try:
+            plt.close(fig)
+            plt.pause(0.001)
+        except Exception:
+            pass
+
+
+def process_benchmark(
+    engine: BaseOCREngine,
+    image_paths: List[str],
+    ground_truth: Optional[Dict[str, str]] = None,
+    show_boxes: bool = True,
+    save_visual_dir: Optional[str] = None,
+) -> List[BenchmarkResult]:
     """Execute OCR on images and record processing metrics.
 
     Args:
         engine (BaseOCREngine): OCR engine instance.
         image_paths (List[str]): List of image file paths to process.
         ground_truth (Optional[Dict[str, str]]): Ground truth dictionary.
+        show_boxes (bool): Whether to display bounding boxes in a window.
+        save_visual_dir (Optional[str]): Directory to save visual output images.
 
     Returns:
         List[BenchmarkResult]: List of benchmark results for each image.
     """
     results = []
+    if save_visual_dir:
+        os.makedirs(save_visual_dir, exist_ok=True)
+
     for path in image_paths:
         file_name = os.path.basename(path)
         print(f"\nProcessing: {path}")
 
         start_time = time.perf_counter()
-        text = engine.process_image(path)
+        text, boxes = engine.process_image(path)
         elapsed_time = time.perf_counter() - start_time
         peak_rss = get_peak_rss_mb()
 
@@ -341,13 +536,31 @@ def process_benchmark(engine: BaseOCREngine, image_paths: List[str], ground_trut
             print(f"WER: {wer:.4f} | CER: {cer:.4f}")
 
         print(
-            f"Time: {elapsed_time:.4f}s | Peak RSS: {peak_rss:.2f} MB"
+            f"Time: {elapsed_time:.4f}s | Peak RSS: {peak_rss:.2f} MB | Detected boxes: {len(boxes)}"
         )
         print("--- Recognized Text ---")
         print(text if text else "[No text detected]")
         print("-" * 40)
 
+        active_fig = None
+        window_title = f"OCR [{engine.name}] - {file_name}"
+        annotated_img = None
+
+        if show_boxes or save_visual_dir:
+            annotated_img = draw_bounding_boxes(path, boxes)
+
+        if save_visual_dir and annotated_img is not None and cv2 is not None:
+            out_img_path = os.path.join(save_visual_dir, f"bbox_{file_name}")
+            cv2.imwrite(out_img_path, annotated_img)
+            print(f"Saved visualization to: {out_img_path}")
+
+        if show_boxes and annotated_img is not None:
+            active_fig = display_bounding_boxes(window_title, annotated_img)
+
         score = prompt_manual_evaluation()
+
+        if active_fig is not None:
+            close_bounding_boxes(active_fig)
 
         results.append(
             BenchmarkResult(
@@ -361,6 +574,13 @@ def process_benchmark(engine: BaseOCREngine, image_paths: List[str], ground_trut
                 cer=cer,
             )
         )
+
+    if plt is not None:
+        try:
+            plt.close("all")
+        except Exception:
+            pass
+
     return results
 
 
@@ -427,6 +647,15 @@ def main():
         "--output",
         help="Path to output JSON file",
     )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Disable displaying bounding boxes in a window",
+    )
+    parser.add_argument(
+        "--save-visual-dir",
+        help="Directory to save annotated images with bounding boxes",
+    )
     args = parser.parse_args()
 
     image_paths = get_image_paths(args.input)
@@ -437,7 +666,14 @@ def main():
     if args.ground_truth:
         ground_truth_map = load_ground_truth(args.ground_truth)
 
-    results = process_benchmark(engine, image_paths, ground_truth_map)
+    show_boxes = not args.no_display
+    results = process_benchmark(
+        engine,
+        image_paths,
+        ground_truth_map,
+        show_boxes=show_boxes,
+        save_visual_dir=args.save_visual_dir,
+    )
 
     if args.output:
         save_results_to_json(results, args.output)
@@ -446,3 +682,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
