@@ -68,7 +68,7 @@ class BenchmarkResult:
     text: str
     execution_time_sec: float
     peak_rss_mb: float
-    manual_evaluation: float
+    manual_evaluation: Optional[float] = None
     wer: Optional[float] = None
     cer: Optional[float] = None
 
@@ -557,7 +557,16 @@ def process_benchmark(
         if show_boxes and annotated_img is not None:
             active_fig = display_bounding_boxes(window_title, annotated_img)
 
-        score = prompt_manual_evaluation()
+        score = None
+        if not (ground_truth and file_name in ground_truth):
+            score = prompt_manual_evaluation()
+        elif active_fig is not None:
+            print("Waiting for the window to be closed to continue...")
+            try:
+                while plt.fignum_exists(active_fig.number):
+                    plt.pause(0.1)
+            except Exception:
+                pass
 
         if active_fig is not None:
             close_bounding_boxes(active_fig)
